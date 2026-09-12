@@ -1,0 +1,99 @@
+name: Run Web Campfire
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+
+concurrency:
+  group: run-server
+  cancel-in-progress: true
+
+jobs:
+  run-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 700
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: huydepayqiu119-cpu/web-campfire
+          token: ${{ secrets.WEBCAMPFIRE }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - run: |
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null 2>&1
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list >/dev/null
+          sudo apt-get update -qq > /dev/null 2>&1 && sudo apt-get install -y ngrok > /dev/null 2>&1
+
+      - name: Start server, ngrok and stream logs
+        run: |
+          tg_json() {
+            curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"$TELEGRAM_CHAT_ID\",\"parse_mode\":\"HTML\",\"text\":$(echo "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}" > /dev/null 2>&1
+          }
+
+          node server.js > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+
+          for i in $(seq 1 15); do curl -s http://localhost:25565/health > /dev/null 2>&1 && break; sleep 2; done
+
+          if ! curl -s http://localhost:25565/health > /dev/null 2>&1; then
+            tg_json "❌ <b>Server failed!</b>&#10;<code>$(tail -20 /tmp/server.log)</code>"
+            exit 1
+          fi
+
+          ngrok config add-authtoken "$NGROK_TOKEN" > /dev/null 2>&1
+          ngrok http 25565 > /tmp/ngrok.log 2>&1 &
+
+          for i in $(seq 1 30); do
+            NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url' 2>/dev/null)
+            [ -n "$NGROK_URL" ] && [ "$NGROK_URL" != "null" ] && break
+            sleep 2
+          done
+
+          if [ -z "$NGROK_URL" ] || [ "$NGROK_URL" = "null" ]; then
+            tg_json "❌ <b>Ngrok failed!</b>&#10;<code>$(tail -10 /tmp/ngrok.log)</code>"
+            exit 1
+          fi
+
+          EARLY_LOG=$(cat /tmp/server.log | head -c 3000)
+          MSG="🌐 <b>Wiki:</b> $NGROK_URL&#10;🖥️ <b>GUI:</b> $NGROK_URL/gui&#10;⏰ $(date '+%Y-%m-%d %H:%M:%S UTC')&#10;&#10;<code>$EARLY_LOG</code>"
+          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"$TELEGRAM_CHAT_ID\",\"parse_mode\":\"HTML\",\"text\":$(echo "$MSG" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}" > /dev/null 2>&1
+
+          echo "Tunnel URL: $NGROK_URL"
+
+          LAST_LINE=$(wc -l < /tmp/server.log)
+          LAST_PING=$(date +%s)
+
+          while true; do
+            sleep 10
+
+            CURRENT_LINE=$(wc -l < /tmp/server.log)
+            if [ "$CURRENT_LINE" -gt "$LAST_LINE" ]; then
+              NEW_LINES=$(sed -n "$((LAST_LINE + 1)),${CURRENT_LINE}p" /tmp/server.log)
+              LAST_LINE=$CURRENT_LINE
+              tg_json "<code>$(echo "$NEW_LINES" | head -c 3500)</code>"
+            fi
+
+            NOW=$(date +%s)
+            if [ $((NOW - LAST_PING)) -ge 1800 ]; then
+              UPTIME=$(ps -p $SERVER_PID -o etime= 2>/dev/null || echo "unknown")
+              tg_json "💓 <b>Still running</b>&#10;Uptime: $UPTIME&#10;URL: <code>$NGROK_URL</code>"
+              LAST_PING=$NOW
+            fi
+
+            kill -0 $SERVER_PID 2>/dev/null || { tg_json "💀 <b>Server process died!</b>"; exit 1; }
+          done
+        env:
+          PORT: 25565
+          NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
