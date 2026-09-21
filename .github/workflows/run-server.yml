@@ -3,7 +3,7 @@ name: Run Web Campfire
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: '0 0 * * *'
 
 concurrency:
   group: run-server
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   run-server:
     runs-on: ubuntu-latest
-    timeout-minutes: 700
+    timeout-minutes: 320
 
     steps:
       - uses: actions/checkout@v4
@@ -72,9 +72,17 @@ jobs:
 
           LAST_LINE=$(wc -l < /tmp/server.log)
           LAST_PING=$(date +%s)
+          START_TIME=$(date +%s)
+          MAX_DURATION=$((5 * 60 * 60))
 
           while true; do
             sleep 10
+
+            NOW=$(date +%s)
+            if [ $((NOW - START_TIME)) -ge $MAX_DURATION ]; then
+              tg_json "⏱ <b>5h limit reached, restarting...</b>"
+              break
+            fi
 
             CURRENT_LINE=$(wc -l < /tmp/server.log)
             if [ "$CURRENT_LINE" -gt "$LAST_LINE" ]; then
@@ -83,7 +91,6 @@ jobs:
               tg_json "<code>$(echo "$NEW_LINES" | head -c 3500)</code>"
             fi
 
-            NOW=$(date +%s)
             if [ $((NOW - LAST_PING)) -ge 1800 ]; then
               UPTIME=$(ps -p $SERVER_PID -o etime= 2>/dev/null || echo "unknown")
               tg_json "💓 <b>Still running</b>&#10;Uptime: $UPTIME&#10;URL: <code>$NGROK_URL</code>"
@@ -97,3 +104,12 @@ jobs:
           NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Trigger next run
+        if: always()
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.WEBCAMPFIRE }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/huydepayqiu119-cpu/github-web-campfire/actions/workflows/run-server.yml/dispatches \
+            -d '{"ref":"main"}'
